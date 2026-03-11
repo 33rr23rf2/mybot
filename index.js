@@ -24,6 +24,14 @@ bot.on('message:text', (ctx) => {
   ctx.reply(`Я отримав твоє повідомлення: ${text}`);
 });
 
+// Обробка помилок
+bot.catch((err) => {
+  const ctx = err.ctx;
+  console.error(`Помилка під час обробки оновлення ${ctx.update.update_id}:`);
+  const e = err.error;
+  console.error("Помилка:", e);
+});
+
 // Запуск бота
 bot.start();
 console.log('Бот запущений...');
