@@ -31,6 +31,7 @@ export function initDB() {
 
   // Migration: Add 'notes' column if it doesn't exist
   const mealsInfo = db.prepare("PRAGMA table_info(meals)").all();
+  
   const hasNotes = mealsInfo.some(col => col.name === 'notes');
   if (!hasNotes) {
     try {
@@ -38,6 +39,16 @@ export function initDB() {
       console.log('Column "notes" added to "meals" table.');
     } catch (e) {
       console.error('Error adding column "notes":', e.message);
+    }
+  }
+
+  const hasDetailsJson = mealsInfo.some(col => col.name === 'details_json');
+  if (!hasDetailsJson) {
+    try {
+      db.exec('ALTER TABLE meals ADD COLUMN details_json TEXT');
+      console.log('Column "details_json" added to "meals" table.');
+    } catch (e) {
+      console.error('Error adding column "details_json":', e.message);
     }
   }
 

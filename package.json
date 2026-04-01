@@ -10,6 +10,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@google/generative-ai": "^0.24.1",
     "@grammyjs/conversations": "^2.1.1",
     "better-sqlite3": "^12.8.0",
     "dotenv": "^17.3.1",
