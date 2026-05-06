@@ -10,6 +10,12 @@ initDB();
 const bot = new Bot(process.env.BOT_TOKEN);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
+// Допоміжна функція для логування помилок
+const logError = (error, context = '') => {
+  const timestamp = new Date().toISOString();
+  console.error(`[${timestamp}] ERROR ${context}:`, error.message || error);
+};
+
 // Допоміжна функція для затримки (sleep)
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -22,7 +28,7 @@ async function estimateCalories(foodText) {
     return defaultResponse;
   }
   
-  const maxRetries = 2; // Спробуємо 2 рази
+  const maxRetries = 2; 
   const modelName = "gemini-3-flash-preview";
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -61,7 +67,7 @@ async function estimateCalories(foodText) {
     } catch (error) {
       logError(`Attempt ${attempt} failed for model ${modelName}: ${error.message}`, 'estimateCalories');
       if (attempt < maxRetries) {
-        await sleep(1000); // Зачекаємо 1 секунду перед повторною спробою
+        await sleep(1000);
       }
     }
   }
@@ -78,7 +84,7 @@ const rateLimitMiddleware = async (ctx, next) => {
   const now = Date.now();
   const lastRequest = userLastRequest.get(userId) || 0;
   
-  if (now - lastRequest < 1000) { // Менше 1 секунди між запитами
+  if (now - lastRequest < 1000) {
     return ctx.reply('⏳ Зачекайте хвилинку, ви надсилаєте запити занадто швидко!');
   }
 
@@ -114,8 +120,114 @@ const mainKeyboard = new Keyboard()
   .text('➕ Add meal')
   .text('📊 Today')
   .row()
+  .text('📋 Plan')
+  .text('💡 Advice')
+  .row()
   .text('⚙️ Set profile')
   .resized();
+
+// Функція для відображення плану
+const planHandler = async (ctx) => {
+  try {
+    const profile = db.prepare('SELECT goal, tdee FROM users WHERE telegram_id = ?').get(ctx.from.id);
+    
+    if (!profile) {
+      return ctx.reply('⚠️ Спочатку заповніть профіль через /set_profile');
+    }
+    
+    if (!profile.goal) {
+      return ctx.reply('⚠️ Оновіть профіль і виберіть вашу ціль');
+    }
+
+    const goalLabels = {
+      lose: 'схуднення',
+      maintain: 'підтримка ваги',
+      gain: 'набір маси'
+    };
+
+    const explanations = {
+      lose: 'Це помірний дефіцит калорій для поступового зниження ваги.',
+      maintain: 'Це оптимальна кількість калорій для збереження поточної ваги.',
+      gain: 'Це невеликий профіцит калорій для поступового набору маси.'
+    };
+
+    await ctx.reply('⏳ <b>Завантажую ваш персональний план...</b>', { parse_mode: 'HTML' });
+
+    let mealIdeas = '';
+    try {
+      const model = genAI.getGenerativeModel({ model: "gemini-3-flash-preview" });
+      const prompt = `Дай 3 дуже короткі та прості ідеї страв для цілі: ${goalLabels[profile.goal]}. 
+      Без медичних порад. Кожна страва одним рядком. Мова: українська.
+      Формат:
+      - Страва 1
+      - Страва 2
+      - Страва 3`;
+      
+      const result = await model.generateContent(prompt);
+      mealIdeas = result.response.text().trim();
+    } catch (aiError) {
+      logError(aiError, 'planHandler/AI');
+      mealIdeas = '- Не вдалося завантажити ідеї страв.';
+    }
+
+    const message = `Ваша ціль: <b>${goalLabels[profile.goal]}</b>\n` +
+      `Рекомендована норма:\n` +
+      `<b>${profile.tdee} kcal / день</b>\n\n` +
+      `${explanations[profile.goal]}\n\n` +
+      `🍴 <b>Ідеї страв:</b>\n${mealIdeas}\n\n` +
+      `<i>Це загальні рекомендації, а не медична порада.</i>`;
+
+    ctx.reply(message, { parse_mode: 'HTML', reply_markup: mainKeyboard });
+  } catch (error) {
+    logError(error, 'plan');
+    replyWithError(ctx);
+  }
+};
+
+// Функція для отримання поради
+async function getAdvice(ctx) {
+  try {
+    const profile = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(ctx.from.id);
+    
+    if (!profile) {
+      return ctx.reply('⚠️ Спочатку заповніть профіль через /set_profile');
+    }
+    
+    if (!profile.goal) {
+      return ctx.reply('⚠️ Оновіть профіль і виберіть вашу ціль');
+    }
+
+    const meals = db.prepare(`
+      SELECT raw_text, calories_estimated 
+      FROM meals 
+      WHERE user_id = ? AND date(timestamp, 'localtime') = date('now', 'localtime')
+    `).all(ctx.from.id);
+
+    const mealList = meals.length > 0 
+      ? meals.map(m => `${m.raw_text} (${m.calories_estimated} ккал)`).join(', ')
+      : 'нічого';
+
+    const goalLabels = { lose: 'схуднення', maintain: 'підтримка ваги', gain: 'набір маси' };
+    
+    await ctx.reply('⏳ <b>Готую персональну пораду...</b>', { parse_mode: 'HTML' });
+
+    const model = genAI.getGenerativeModel({ model: "gemini-3-flash-preview" });
+    const prompt = `Я ${profile.sex.toLowerCase()}, мені ${profile.age} років, зріст ${profile.height} см, вага ${profile.weight} кг, ціль — ${goalLabels[profile.goal]}. 
+    Сьогодні я з'їв: ${mealList}. 
+    Дай одну коротку та влучну пораду на вечір (1-2 речення) українською мовою.`;
+
+    const result = await model.generateContent(prompt);
+    const advice = result.response.text().trim();
+
+    await ctx.reply(`💡 <b>Порада дня:</b>\n\n${advice}`, { 
+      parse_mode: 'HTML',
+      reply_markup: mainKeyboard 
+    });
+  } catch (error) {
+    logError(error, 'getAdvice');
+    replyWithError(ctx);
+  }
+}
 
 // Допоміжна функція для повідомлення про помилку користувачу
 const replyWithError = async (ctx) => {
@@ -199,17 +311,41 @@ async function setProfile(conversation, ctx) {
     const activityLevel = actCtx.callbackQuery.data;
     await actCtx.answerCallbackQuery();
 
+    // 6️⃣ Ціль
+    const goalKeyboard = new InlineKeyboard()
+      .text('🔻 Схуднення', 'lose').row()
+      .text('⚖️ Підтримка', 'maintain').row()
+      .text('🔺 Набір маси', 'gain');
+
+    await ctx.reply('6️⃣ <b>Яка ваша ціль?</b>', { 
+      reply_markup: goalKeyboard,
+      parse_mode: 'HTML' 
+    });
+
+    const goalCtx = await conversation.waitForCallbackQuery(['lose', 'maintain', 'gain']);
+    const goal = goalCtx.callbackQuery.data;
+    await goalCtx.answerCallbackQuery();
+
     let bmr = (sex === 'Чоловік') 
       ? (10 * weight + 6.25 * height - 5 * age + 5) 
       : (10 * weight + 6.25 * height - 5 * age - 161);
-    const tdee = Math.round(bmr * activityMultiplier);
+    
+    let tdee = Math.round(bmr * activityMultiplier);
+
+    // Коригування залежно від цілі
+    if (goal === 'lose') {
+      tdee = tdee - 400; // Дефіцит 400 ккал
+    } else if (goal === 'gain') {
+      tdee = tdee + 300; // Профіцит 300 ккал
+    }
+    
     bmr = Math.round(bmr);
 
     try {
       db.prepare(`
-        INSERT OR REPLACE INTO users (telegram_id, sex, age, height, weight, activity_level, bmr, tdee)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(ctx.from.id, sex, age, height, weight, activityLevel, bmr, tdee);
+        INSERT OR REPLACE INTO users (telegram_id, sex, age, height, weight, activity_level, bmr, tdee, goal)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(ctx.from.id, sex, age, height, weight, activityLevel, bmr, tdee, goal);
     } catch (dbError) {
       logError(dbError, 'setProfile/database');
       return replyWithError(ctx);
@@ -282,7 +418,6 @@ async function addMeal(conversation, ctx) {
       items = result.items;
     }
 
-    // Збереження результату
     try {
       db.prepare('INSERT INTO meals (user_id, raw_text, calories_estimated, details_json) VALUES (?, ?, ?, ?)')
         .run(ctx.from.id, rawText, total_calories, JSON.stringify(result || { manual: true }));
@@ -291,7 +426,6 @@ async function addMeal(conversation, ctx) {
       return replyWithError(ctx);
     }
 
-    // Показати результат
     let detailsMessage = `✅ <b>Запис збережено!</b>\n\n`;
     if (items && items.length > 0) {
       detailsMessage += items.map(item => `🔹 ${item.name} — <b>${item.calories}</b> kcal`).join('\n');
@@ -372,6 +506,11 @@ const logFoodHandler = (ctx) => ctx.conversation.enter('logFood');
 const todayHandler = (ctx) => {
   try {
     const profile = db.prepare('SELECT tdee FROM users WHERE telegram_id = ?').get(ctx.from.id);
+    
+    if (!profile) {
+      return ctx.reply('⚠️ Спочатку заповніть профіль через /set_profile');
+    }
+
     const meals = db.prepare(`
       SELECT *, time(timestamp, 'localtime') as clock 
       FROM meals 
@@ -420,7 +559,7 @@ const todayHandler = (ctx) => {
 };
 
 bot.command('info', (ctx) => {
-  ctx.reply('ℹ️ <b>Про бота:</b>\nВерсія: 1.6.0\nБаза даних: SQLite\nФункції: Розрахунок калорій, логування харчування з нотатками та часом.', { parse_mode: 'HTML' });
+  ctx.reply('ℹ️ <b>Про бота:</b>\nВерсія: 1.7.0\nБаза даних: SQLite\nФункції: Розрахунок калорій, логування харчування з нотатками та часом.', { parse_mode: 'HTML' });
 });
 
 bot.command('start', startHandler);
@@ -428,17 +567,33 @@ bot.command('set_profile', setProfileHandler);
 bot.command('add_meal', addMealHandler);
 bot.command('log_food', logFoodHandler);
 bot.command('today', todayHandler);
+bot.command('advice', getAdvice);
+bot.command('plan', planHandler);
 
 bot.command('my_profile', (ctx) => {
   try {
     const profile = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(ctx.from.id);
-    if (!profile) return ctx.reply('Спочатку пройдіть реєстрацію /set_profile');
+    
+    if (!profile) {
+      return ctx.reply('⚠️ Спочатку заповніть профіль через /set_profile');
+    }
+    
+    if (!profile.goal) {
+      return ctx.reply('⚠️ Оновіть профіль і виберіть вашу ціль');
+    }
+
+    const goalLabels = {
+      lose: 'Схуднення 📉',
+      maintain: 'Підтримка ваги ⚖️',
+      gain: 'Набір маси 📈'
+    };
 
     const message = `📋 <b>Ваш профіль:</b>\n\n` +
       `👤 Стать: ${profile.sex}\n` +
       `🎂 Вік: ${profile.age} років\n` +
       `📏 Зріст: ${profile.height} см\n` +
-      `⚖️ Вага: ${profile.weight} кг\n\n` +
+      `⚖️ Вага: ${profile.weight} кг\n` +
+      `🎯 Ціль: ${goalLabels[profile.goal] || 'Не вказано'}\n\n` +
       `🔥 <b>BMR:</b> ${profile.bmr} ккал\n` +
       `🚀 <b>TDEE:</b> ${profile.tdee} ккал`;
     ctx.reply(message, { parse_mode: 'HTML', reply_markup: mainKeyboard });
@@ -450,7 +605,9 @@ bot.command('my_profile', (ctx) => {
 
 bot.hears('➕ Add meal', addMealHandler);
 bot.hears('📊 Today', todayHandler);
+bot.hears('📋 Plan', planHandler);
 bot.hears('⚙️ Set profile', setProfileHandler);
+bot.hears('💡 Advice', getAdvice);
 
 bot.command('history', (ctx) => {
   try {
@@ -486,6 +643,7 @@ bot.command('help', (ctx) => {
     '/add_meal - Додати прийом їжі (швидко)\n' +
     '/log_food - Логування з калоріями та нотаткою\n' +
     '/today - Прийоми їжі за сьогодні\n' +
+    '/plan - Ваш персональний план\n' +
     '/history - Останні 10 записів\n' +
     '/my_profile - Профіль та розрахунки\n' +
     '/help - Список команд\n' +

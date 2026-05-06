@@ -52,6 +52,17 @@ export function initDB() {
     }
   }
 
+  const usersInfo = db.prepare("PRAGMA table_info(users)").all();
+  const hasGoal = usersInfo.some(col => col.name === 'goal');
+  if (!hasGoal) {
+    try {
+      db.exec('ALTER TABLE users ADD COLUMN goal TEXT');
+      console.log('Column "goal" added to "users" table.');
+    } catch (e) {
+      console.error('Error adding column "goal":', e.message);
+    }
+  }
+
   console.log('✅ База даних ініціалізована.');
 }
 
